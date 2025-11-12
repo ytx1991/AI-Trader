@@ -1,4 +1,5 @@
 import os
+import logging
 
 from dotenv import load_dotenv
 
@@ -14,6 +15,8 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 from tools.general_tools import get_config_value
+
+logger = logging.getLogger(__name__)
 
 
 def get_market_type() -> str:
@@ -714,34 +717,181 @@ def get_today_init_position(today_date: str, signature: str) -> Dict[str, float]
 
 def get_latest_position(today_date: str, signature: str) -> Tuple[Dict[str, float], int]:
     """
-    获取最新持仓。从 ../data/agent_data/{signature}/position/position.jsonl 中读取。
-    优先选择当天 (today_date) 中 id 最大的记录；
-    若当天无记录，则回退到上一个交易日，选择该日中 id 最大的记录。
-
+    获取最新持仓。从 Arbitrum 区块链钱包获取实际持仓，扫描所有代币并筛选出在 STOCK_ADDRESS 中的股票代币。
+    
+    区块链模式:
+    - 持仓数据: 从链上读取（股票代币 + USDC）
+    - 股票代币: 从 STOCK_ADDRESS 匹配的代币余额
+    - CASH 余额: 从 USDC (Native USDC on Arbitrum) 代币余额获取
+    - max_id: 返回 -1（表示区块链模式，不维护 position.jsonl）
+    - 交易操作: buy() 和 sell() 自动检测并跳过文件写入
+    - 需要设置环境变量启用
+    
+    文件模式（回退）:
+    - 从 position.jsonl 文件读取持仓
+    - 返回实际的 max_id
+    - 交易操作会写入 position.jsonl
+    
+    环境变量:
+    - USE_BLOCKCHAIN_POSITION: 设置为 'true' 启用区块链模式
+    - ARB_WALLET_ADDRESS: Arbitrum 钱包地址（区块链模式必需）
+    - ALCHEMY_ARB_API_KEY: Alchemy Arbitrum API 密钥（区块链模式必需）
+    
     Args:
         today_date: 日期字符串，格式 YYYY-MM-DD，代表今天日期。
         signature: 模型名称，用于构建文件路径。
 
     Returns:
         (positions, max_id):
-          - positions: {symbol: weight} 的字典；若未找到任何记录，则为空字典。
-          - max_id: 选中记录的最大 id；若未找到任何记录，则为 -1.
+          - positions: {symbol: amount} 的字典，包含股票代币数量和 CASH (USDC) 余额。
+          - max_id: 区块链模式返回 -1；文件模式返回实际的最大操作 ID。
+    """
+    import asyncio
+    from agent_tools.blockchain.alchemy import get_tokens_balance
+    from agent_tools.blockchain.constants import STOCK_ADDRESS
+    from tools.general_tools import get_config_value
+    
+    # Check if blockchain mode is enabled
+    use_blockchain = os.getenv("USE_BLOCKCHAIN_POSITION", "false").lower() in ("true", "1", "yes")
+    
+    if not use_blockchain:
+        # Fall back to original file-based implementation
+        logger.info("Blockchain position mode disabled, using file-based position")
+        return _get_latest_position_from_file(today_date, signature)
+    
+    # Get wallet address from environment variables (Arbitrum only)
+    wallet_address = os.getenv("ARB_WALLET_ADDRESS")
+    
+    if not wallet_address:
+        logger.warning("ARB_WALLET_ADDRESS not set, falling back to file-based position")
+        return _get_latest_position_from_file(today_date, signature)
+    
+    # In blockchain mode, no position.jsonl is maintained
+    # Return -1 as max_id to indicate blockchain mode to callers
+    max_id = -1
+    logger.debug("Blockchain mode: position.jsonl not used, max_id set to -1")
+    
+    # Use Arbitrum network only
+    network = "arbitrum"
+    
+    try:
+        # Get all tokens in the wallet
+        tokens_data = asyncio.run(get_tokens_balance(wallet_address, network))
+        
+        if not tokens_data:
+            logger.warning(f"Failed to get tokens balance for wallet {wallet_address[:10]}... on {network}, falling back to file")
+            return _get_latest_position_from_file(today_date, signature)
+        
+        # Build a mapping from token_address to symbol
+        token_address_to_symbol = {
+            info.token_address.lower(): symbol
+            for symbol, info in STOCK_ADDRESS.items()
+        }
+        
+        # Get USDC address for Arbitrum (for CASH balance)
+        from agent_tools.blockchain.evm import TOKEN_ADDRESSES
+        usdc_address = TOKEN_ADDRESSES.get("arbitrum", {}).get("USDC", "").lower()
+        
+        # Extract token balances and filter for stock tokens
+        positions = {}
+        total_value = 0.0
+        cash_balance = 0.0  # USDC balance for CASH
+        
+        # Alchemy API response structure varies, try different possible structures
+        tokens = []
+        if isinstance(tokens_data, dict):
+            tokens = tokens_data.get("tokens", [])
+            if not tokens and "data" in tokens_data:
+                tokens = tokens_data["data"].get("tokens", [])
+        elif isinstance(tokens_data, list):
+            tokens = tokens_data
+        
+        logger.debug(f"Found {len(tokens)} tokens in wallet")
+        
+        for token in tokens:
+            # Try different possible field names for token address
+            token_address = (
+                token.get("tokenAddress") or 
+                token.get("token_address") or 
+                token.get("contractAddress") or 
+                token.get("address") or 
+                ""
+            ).lower()
+            
+            # Get balance (may need to convert from string)
+            balance_raw = token.get("balance") or token.get("amount") or 0
+            try:
+                balance = float(balance_raw) if balance_raw else 0
+            except (ValueError, TypeError):
+                balance = 0
+            
+            # Get decimals to convert balance to actual amount
+            decimals = token.get("decimals", 18)
+            balance_actual = balance / (10 ** decimals)
+            
+            # Get price (in USD)
+            price_data = token.get("price") or token.get("priceUsd") or {}
+            if isinstance(price_data, dict):
+                price = float(price_data.get("value", 0) or 0)
+            else:
+                try:
+                    price = float(price_data) if price_data else 0
+                except (ValueError, TypeError):
+                    price = 0
+            
+            # Check if this is USDC (for CASH balance)
+            if token_address == usdc_address and balance_actual > 0:
+                # USDC balance represents CASH
+                cash_balance = balance_actual
+                logger.debug(f"Found USDC token ({token_address[:10]}...), balance: {balance_actual:.6f} USDC (CASH)")
+            
+            # Check if this token is in our STOCK_ADDRESS
+            elif token_address in token_address_to_symbol and balance_actual > 0:
+                symbol = token_address_to_symbol[token_address]
+                # Store actual token count (not weighted)
+                positions[symbol] = balance_actual
+                value = balance_actual * price
+                total_value += value
+                logger.debug(f"Found stock token {symbol} ({token_address[:10]}...), balance: {balance_actual:.6f}, price: ${price:.2f}, value: ${value:.2f}")
+        
+        # Set CASH position from USDC balance
+        positions["CASH"] = cash_balance
+        
+        logger.info(f"Loaded {len(positions)} positions from blockchain wallet {wallet_address[:10]}... on {network}")
+        logger.info(f"  Stock tokens: {len([k for k in positions.keys() if k != 'CASH'])} positions, total value: ${total_value:.2f}")
+        logger.info(f"  CASH (USDC): ${cash_balance:.2f}")
+        return positions, max_id  # Return max_id read from position.jsonl
+        
+    except Exception as e:
+        logger.error(f"Error getting positions from blockchain: {e}")
+        import traceback
+        traceback.print_exc()
+        logger.info("Falling back to file-based position")
+        return _get_latest_position_from_file(today_date, signature)
+
+
+def _get_latest_position_from_file(today_date: str, signature: str) -> Tuple[Dict[str, float], int]:
+    """
+    从 position.jsonl 文件读取最新持仓（原始实现的辅助函数）。
+    
+    Args:
+        today_date: 日期字符串，格式 YYYY-MM-DD
+        signature: 模型名称
+    
+    Returns:
+        (positions, max_id)
     """
     from tools.general_tools import get_config_value
-
+    
     base_dir = Path(__file__).resolve().parents[1]
-
-    # Get log_path from config, default to "agent_data" for backward compatibility
     log_path = get_config_value("LOG_PATH", "./data/agent_data")
     if log_path.startswith("./data/"):
-        log_path = log_path[7:]  # Remove "./data/" prefix
-
+        log_path = log_path[7:]
     position_file = base_dir / "data" / log_path / signature / "position" / "position.jsonl"
-
+    
     if not position_file.exists():
         return {}, -1
-
-    # 获取市场类型，智能判断
+    
     market = get_market_type()
     
     # Step 1: 先查找当天的记录
@@ -801,7 +951,6 @@ def get_latest_position(today_date: str, signature: str) -> Tuple[Dict[str, floa
                     continue
         
         if all_records:
-            # 按日期和id排序，取最新的一条
             all_records.sort(key=lambda x: (x.get("date", ""), x.get("id", 0)), reverse=True)
             latest_positions_prev = all_records[0].get("positions", {})
             max_id_prev = all_records[0].get("id", -1)

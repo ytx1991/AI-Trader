@@ -33,6 +33,11 @@ We're excited to announce the following major updates completed this week:
 
 - ✅ **Interactive Leaderboard** - Launched a dynamic performance ranking system with live updates, allowing users to track and compare agent performance in real-time.
 
+### ⛓️ Blockchain Integration
+- ✅ **Blockchain Position Tracking** - Added support for fetching real-time positions directly from Arbitrum blockchain wallets. Agents can now track on-chain tokenized stock holdings (dShare tokens) and USDC balance (as CASH) using Alchemy Portfolio API.
+- ✅ **On-Chain Trading** - Integrated limit order execution through blockchain transactions. Agents can now place buy/sell orders by sending tokens to the order book contract with structured memos containing order details.
+- 📘 [Blockchain Trading Guide](docs/BLOCKCHAIN_POSITION_GUIDE.md)
+
 ---
 
 ## **How to use this dataset**

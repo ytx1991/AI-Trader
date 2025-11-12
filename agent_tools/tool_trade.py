@@ -1,22 +1,24 @@
 import os
 import sys
 from typing import Any, Dict, List, Optional
+import asyncio
+import json
+import fcntl
+from pathlib import Path
 
 from fastmcp import FastMCP
 
-from typing import Dict, List, Optional, Any
-import fcntl
-from pathlib import Path
 # Add project root directory to Python path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
-import json
 
 from tools.general_tools import get_config_value, write_config_value
 from tools.price_tools import (get_latest_position, get_open_prices,
                                get_yesterday_date,
                                get_yesterday_open_and_close_price,
                                get_yesterday_profit)
+from agent_tools.blockchain.evm import ARBITRUM_CLIENT, USDC_DECIMAL
+from agent_tools.blockchain.constants import STOCK_ADDRESS, TRADING_ADDRESS, USDC_ADDRESSES
 
 mcp = FastMCP("TradeTools")
 
@@ -42,7 +44,7 @@ def _position_lock(signature: str):
 
 
 @mcp.tool()
-def buy(symbol: str, amount: int) -> Dict[str, Any]:
+def buy(symbol: str, amount: int, expiry_days: int = 2) -> Dict[str, Any]:
     """
     Buy stock function
 
@@ -51,12 +53,13 @@ def buy(symbol: str, amount: int) -> Dict[str, Any]:
     2. Get stock opening price for the day
     3. Validate buy conditions (sufficient cash, lot size for CN market)
     4. Update position (increase stock quantity, decrease cash)
-    5. Record transaction to position.jsonl file
+    5. Record transaction to position.jsonl file (or execute blockchain transaction)
 
     Args:
         symbol: Stock symbol, such as "AAPL", "MSFT", etc.
         amount: Buy quantity, must be a positive integer, indicating how many shares to buy
                 For Chinese A-shares (symbols ending with .SH or .SZ), must be multiples of 100
+        expiry_days: Number of days until the limit order expires (default: 2)
 
     Returns:
         Dict[str, Any]:
@@ -71,6 +74,7 @@ def buy(symbol: str, amount: int) -> Dict[str, Any]:
         >>> print(result)  # {"AAPL": 110, "MSFT": 5, "CASH": 5000.0, ...}
         >>> result = buy("600519.SH", 100)  # Chinese A-shares must be multiples of 100
         >>> print(result)  # {"600519.SH": 100, "CASH": 85000.0, ...}
+        >>> result = buy("AAPL", 10, expiry_days=3)  # Limit order expires in 3 days
     """
     # Step 1: Get environment variables and basic information
     # Get signature (model name) from environment variable, used to determine data storage path
@@ -147,29 +151,92 @@ def buy(symbol: str, amount: int) -> Dict[str, Any]:
         new_position[symbol] += amount
 
         # Step 6: Record transaction to position.jsonl file
-        # Build file path: {project_root}/data/{log_path}/{signature}/position/position.jsonl
-        # Use append mode ("a") to write new transaction record
-        # Each operation ID increments by 1, ensuring uniqueness of operation sequence
-        log_path = get_config_value("LOG_PATH", "./data/agent_data")
-        if log_path.startswith("./data/"):
-            log_path = log_path[7:]  # Remove "./data/" prefix
-        position_file_path = os.path.join(project_root, "data", log_path, signature, "position", "position.jsonl")
-        with open(position_file_path, "a") as f:
-            # Write JSON format transaction record, containing date, operation ID, transaction details and updated position
-            print(
-                f"Writing to position.jsonl: {json.dumps({'date': today_date, 'id': current_action_id + 1, 'this_action':{'action':'buy','symbol':symbol,'amount':amount},'positions': new_position})}"
-            )
-            f.write(
-                json.dumps(
-                    {
-                        "date": today_date,
-                        "id": current_action_id + 1,
-                        "this_action": {"action": "buy", "symbol": symbol, "amount": amount},
-                        "positions": new_position,
-                    }
+        # In blockchain mode (indicated by current_action_id == -1), skip writing to position.jsonl
+        # Position data is maintained on-chain in blockchain mode
+        use_blockchain = os.getenv("USE_BLOCKCHAIN_POSITION", "true").lower() in ("true", "1", "yes")
+        
+        if not use_blockchain:
+            # File mode: write transaction to position.jsonl
+            log_path = get_config_value("LOG_PATH", "./data/agent_data")
+            if log_path.startswith("./data/"):
+                log_path = log_path[7:]  # Remove "./data/" prefix
+            position_file_path = os.path.join(project_root, "data", log_path, signature, "position", "position.jsonl")
+            with open(position_file_path, "a") as f:
+                # Write JSON format transaction record, containing date, operation ID, transaction details and updated position
+                print(
+                    f"Writing to position.jsonl: {json.dumps({'date': today_date, 'id': current_action_id + 1, 'this_action':{'action':'buy','symbol':symbol,'amount':amount},'positions': new_position})}"
                 )
-                + "\n"
-            )
+                f.write(
+                    json.dumps(
+                        {
+                            "date": today_date,
+                            "id": current_action_id + 1,
+                            "this_action": {"action": "buy", "symbol": symbol, "amount": amount},
+                            "positions": new_position,
+                        }
+                    )
+                    + "\n"
+                )
+        else:
+            # Blockchain mode: Execute limit buy order on-chain
+            print(f"Blockchain mode: Placing limit BUY order for {amount} shares of {symbol} at ${this_symbol_price:.2f}")
+            
+            try:
+                # Get wallet address and private key from environment
+                wallet_address = os.getenv("ARB_WALLET_ADDRESS")
+                private_key = os.getenv("ARB_PRIVATE_KEY")
+                
+                if not wallet_address or not private_key:
+                    raise ValueError("ARB_WALLET_ADDRESS and ARB_PRIVATE_KEY must be set for blockchain trading")
+                
+                # Get stock token address
+                if symbol not in STOCK_ADDRESS:
+                    raise ValueError(f"Stock token address not found for {symbol}")
+                
+                stock_token_address = STOCK_ADDRESS[symbol].token_address
+                
+                # Calculate amounts in wei
+                # For buy order: offer USDC, request stock tokens
+                usdc_amount_wei = int(this_symbol_price * amount * (10 ** 6))  # USDC has 6 decimals
+                stock_amount_wei = int(amount * (10 ** 18))  # Stock tokens typically have 18 decimals
+                
+                # Construct memo JSON
+                memo = {
+                    "did_id": wallet_address,
+                    "request": str(stock_amount_wei),  # Request stock tokens
+                    "offer": str(usdc_amount_wei),     # Offer USDC
+                    "type": "LIMIT",
+                    "token_address": stock_token_address,
+                    "customer_id": "SVIM",
+                    "expiry_days": expiry_days
+                }
+                memo_text = json.dumps(memo)
+                
+                # Recipient address for all trades
+                recipient_address = TRADING_ADDRESS
+                
+                # USDC token address on Arbitrum
+                usdc_address = USDC_ADDRESSES["arbitrum"]
+                
+                print(f"  Sending {usdc_amount_wei / (10**6):.6f} USDC to {recipient_address[:10]}...")
+                print(f"  Memo: {memo_text[:100]}...")
+                
+                # Execute blockchain transaction
+                tx_hash = asyncio.run(ARBITRUM_CLIENT.send_token_with_memo(
+                    token_address=usdc_address,
+                    recipient_address=recipient_address,
+                    amount=usdc_amount_wei,
+                    memo_text=memo_text,
+                    private_key=private_key
+                ))
+                
+                print(f"  ✓ Transaction submitted: {tx_hash}")
+                print(f"  Expected new CASH: ${new_position['CASH']:.2f}, Expected new {symbol} position: {new_position.get(symbol, 0)}")
+                
+            except Exception as e:
+                print(f"  ✗ Blockchain transaction failed: {e}")
+                return {"error": f"Blockchain transaction failed: {e}", "symbol": symbol, "date": today_date}
+        
         # Step 7: Return updated position
         write_config_value("IF_TRADE", True)
         print("IF_TRADE", get_config_value("IF_TRADE"))
@@ -214,7 +281,7 @@ def _get_today_buy_amount(symbol: str, today_date: str, signature: str) -> int:
 
 
 @mcp.tool()
-def sell(symbol: str, amount: int) -> Dict[str, Any]:
+def sell(symbol: str, amount: int, expiry_days: int = 2) -> Dict[str, Any]:
     """
     Sell stock function
 
@@ -223,13 +290,14 @@ def sell(symbol: str, amount: int) -> Dict[str, Any]:
     2. Get stock opening price for the day
     3. Validate sell conditions (position exists, sufficient quantity, lot size, T+1 for CN market)
     4. Update position (decrease stock quantity, increase cash)
-    5. Record transaction to position.jsonl file
+    5. Record transaction to position.jsonl file (or execute blockchain transaction)
 
     Args:
         symbol: Stock symbol, such as "AAPL", "MSFT", etc.
         amount: Sell quantity, must be a positive integer, indicating how many shares to sell
                 For Chinese A-shares (symbols ending with .SH or .SZ), must be multiples of 100
                 and cannot sell shares bought on the same day (T+1 rule)
+        expiry_days: Number of days until the limit order expires (default: 2)
 
     Returns:
         Dict[str, Any]:
@@ -244,6 +312,7 @@ def sell(symbol: str, amount: int) -> Dict[str, Any]:
         >>> print(result)  # {"AAPL": 90, "MSFT": 5, "CASH": 15000.0, ...}
         >>> result = sell("600519.SH", 100)  # Chinese A-shares must be multiples of 100
         >>> print(result)  # {"600519.SH": 0, "CASH": 115000.0, ...}
+        >>> result = sell("AAPL", 10, expiry_days=3)  # Limit order expires in 3 days
     """
     # Step 1: Get environment variables and basic information
     # Get signature (model name) from environment variable, used to determine data storage path
@@ -333,29 +402,88 @@ def sell(symbol: str, amount: int) -> Dict[str, Any]:
     new_position["CASH"] = new_position.get("CASH", 0) + this_symbol_price * amount
 
     # Step 6: Record transaction to position.jsonl file
-    # Build file path: {project_root}/data/{log_path}/{signature}/position/position.jsonl
-    # Use append mode ("a") to write new transaction record
-    # Each operation ID increments by 1, ensuring uniqueness of operation sequence
-    log_path = get_config_value("LOG_PATH", "./data/agent_data")
-    if log_path.startswith("./data/"):
-        log_path = log_path[7:]  # Remove "./data/" prefix
-    position_file_path = os.path.join(project_root, "data", log_path, signature, "position", "position.jsonl")
-    with open(position_file_path, "a") as f:
-        # Write JSON format transaction record, containing date, operation ID and updated position
-        print(
-            f"Writing to position.jsonl: {json.dumps({'date': today_date, 'id': current_action_id + 1, 'this_action':{'action':'sell','symbol':symbol,'amount':amount},'positions': new_position})}"
-        )
-        f.write(
-            json.dumps(
-                {
-                    "date": today_date,
-                    "id": current_action_id + 1,
-                    "this_action": {"action": "sell", "symbol": symbol, "amount": amount},
-                    "positions": new_position,
-                }
+    # In blockchain mode, skip writing to position.jsonl
+    # Position data is maintained on-chain in blockchain mode
+    use_blockchain = os.getenv("USE_BLOCKCHAIN_POSITION", "true").lower() in ("true", "1", "yes")
+    
+    if not use_blockchain:
+        # File mode: write transaction to position.jsonl
+        log_path = get_config_value("LOG_PATH", "./data/agent_data")
+        if log_path.startswith("./data/"):
+            log_path = log_path[7:]  # Remove "./data/" prefix
+        position_file_path = os.path.join(project_root, "data", log_path, signature, "position", "position.jsonl")
+        with open(position_file_path, "a") as f:
+            # Write JSON format transaction record, containing date, operation ID and updated position
+            print(
+                f"Writing to position.jsonl: {json.dumps({'date': today_date, 'id': current_action_id + 1, 'this_action':{'action':'sell','symbol':symbol,'amount':amount},'positions': new_position})}"
             )
-            + "\n"
-        )
+            f.write(
+                json.dumps(
+                    {
+                        "date": today_date,
+                        "id": current_action_id + 1,
+                        "this_action": {"action": "sell", "symbol": symbol, "amount": amount},
+                        "positions": new_position,
+                    }
+                )
+                + "\n"
+            )
+    else:
+        # Blockchain mode: Execute limit sell order on-chain
+        print(f"Blockchain mode: Placing limit SELL order for {amount} shares of {symbol} at ${this_symbol_price:.2f}")
+        
+        try:
+            # Get wallet address and private key from environment
+            wallet_address = os.getenv("ARB_WALLET_ADDRESS")
+            private_key = os.getenv("ARB_PRIVATE_KEY")
+            
+            if not wallet_address or not private_key:
+                raise ValueError("ARB_WALLET_ADDRESS and ARB_PRIVATE_KEY must be set for blockchain trading")
+            
+            # Get stock token address
+            if symbol not in STOCK_ADDRESS:
+                raise ValueError(f"Stock token address not found for {symbol}")
+            
+            stock_token_address = STOCK_ADDRESS[symbol].token_address
+            
+            # Calculate amounts in wei
+            # For sell order: offer stock tokens, request USDC
+            usdc_amount_wei = int(this_symbol_price * amount * (10 ** 6))  # USDC has 6 decimals
+            stock_amount_wei = int(amount * (10 ** 18))  # Stock tokens typically have 18 decimals
+            
+            # Construct memo JSON
+            memo = {
+                "did_id": wallet_address,
+                "request": str(usdc_amount_wei),    # Request USDC
+                "offer": str(stock_amount_wei),     # Offer stock tokens
+                "type": "LIMIT",
+                "token_address": stock_token_address,
+                "customer_id": "SVIM",
+                "expiry_days": expiry_days
+            }
+            memo_text = json.dumps(memo)
+            
+            # Recipient address for all trades
+            recipient_address = TRADING_ADDRESS
+            
+            print(f"  Sending {stock_amount_wei / (10**18):.6f} {symbol} tokens to {recipient_address[:10]}...")
+            print(f"  Memo: {memo_text[:100]}...")
+            
+            # Execute blockchain transaction (send stock tokens)
+            tx_hash = asyncio.run(ARBITRUM_CLIENT.send_token_with_memo(
+                token_address=stock_token_address,
+                recipient_address=recipient_address,
+                amount=stock_amount_wei,
+                memo_text=memo_text,
+                private_key=private_key
+            ))
+            
+            print(f"  ✓ Transaction submitted: {tx_hash}")
+            print(f"  Expected new CASH: ${new_position['CASH']:.2f}, Expected new {symbol} position: {new_position.get(symbol, 0)}")
+            
+        except Exception as e:
+            print(f"  ✗ Blockchain transaction failed: {e}")
+            return {"error": f"Blockchain transaction failed: {e}", "symbol": symbol, "date": today_date}
 
     # Step 7: Return updated position
     write_config_value("IF_TRADE", True)

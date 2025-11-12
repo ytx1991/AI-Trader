@@ -16,7 +16,8 @@ sys.path.insert(0, project_root)
 from tools.general_tools import get_config_value
 from tools.price_tools import (all_nasdaq_100_symbols, all_sse_50_symbols,
                                format_price_dict_with_names, get_open_prices,
-                               get_today_init_position, get_yesterday_date,
+                               get_today_init_position, get_latest_position,
+                               get_yesterday_date,
                                get_yesterday_open_and_close_price,
                                get_yesterday_profit)
 
@@ -36,9 +37,11 @@ Thinking standards:
   - Read input of yesterday's positions and today's prices
   - Update valuation and adjust weights for each target (if strategy requires)
 
-Notes:
+Trading execution:
 - You don't need to request user permission during operations, you can execute directly
 - You must execute operations by calling tools, directly output operations will not be accepted
+- When blockchain mode is enabled, trades are executed on-chain as limit orders
+- Position data is fetched in real-time from blockchain wallet (if blockchain mode enabled)
 
 Here is the information you need:
 
@@ -47,6 +50,7 @@ Current time:
 
 Your current positions (numbers after stock codes represent how many shares you hold, numbers after CASH represent your available cash):
 {positions}
+
 
 The current value represented by the stocks you hold:
 {yesterday_close_price}
@@ -70,12 +74,31 @@ def get_agent_system_prompt(
     if stock_symbols is None:
         stock_symbols = all_sse_50_symbols if market == "cn" else all_nasdaq_100_symbols
 
+    # Check if blockchain position mode is enabled
+    use_blockchain = os.getenv("USE_BLOCKCHAIN_POSITION", "true").lower() in ("true", "1", "yes")
+    
+    if use_blockchain:
+        print("Using blockchain position data")
+        # Get position from blockchain
+        today_init_position, max_id = get_latest_position(today_date, signature)
+        print(f"Loaded position from blockchain: {len(today_init_position)} assets")
+        if max_id == -1:
+            print("Blockchain mode active (max_id = -1)")
+        
+        # Add blockchain mode indicator to prompt
+        wallet_address = os.getenv("ARB_WALLET_ADDRESS", "N/A")
+        position_source = f"\n[Data Source: Blockchain - Arbitrum wallet {wallet_address[:10]}...]"
+    else:
+        print("Using file-based position data")
+        # Get position from file (legacy mode)
+        today_init_position = get_today_init_position(today_date, signature)
+        position_source = "\n[Data Source: Local position file]"
+
     # Get yesterday's buy and sell prices
     yesterday_buy_prices, yesterday_sell_prices = get_yesterday_open_and_close_price(
         today_date, stock_symbols, market=market
     )
     today_buy_price = get_open_prices(today_date, stock_symbols, market=market)
-    today_init_position = get_today_init_position(today_date, signature)
     # yesterday_profit = get_yesterday_profit(today_date, yesterday_buy_prices, yesterday_sell_prices, today_init_position)
     
     return agent_system_prompt.format(
